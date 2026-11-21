@@ -126,6 +126,28 @@ def is_alias(w: str) -> bool:
     return any(re.fullmatch(p, w, flags=re.I) for p in ALIASES)
 
 
+THESAURUS = {
+    r"\bkeep-?alive": "heartbeat",
+    r"\bcoordinator\b": "leader",
+    r"\bsubordinate|\bfollowers?\b": "follower",
+    r"\belection trigger|\btrigger(?:ing)? (?:an )?election": "election timeout",
+    r"\bscalar coefficient|\bstep size\b": "learning rate",
+    r"\bgradient adjustment": "gradient update",
+    r"\brelational database": "PostgreSQL relational table",
+    r"\basymmetric": "public key RSA",
+    r"\bmilliseconds?\b": "ms",
+}
+
+
+def thesaurus(q: str) -> str:
+    """Append the KB's own wording for common paraphrases (used for retrieval only)."""
+    extra = [w for pat, w in THESAURUS.items() if re.search(pat, q, re.I)]
+    return q + (THES_SEP + " ".join(extra) if extra else "")
+
+
+THES_SEP = " ;; "
+
+
 def expand(q: str) -> str:
     def acro(m):
         w = m.group(0)
@@ -163,6 +185,7 @@ for ts in P_TOKS:
 IDF = {t: math.log(1 + N / df) for t, df in DF.items()}
 
 SENTS = [split_sentences(p) for p in KB]
+KB_LOWER = "\n".join(KB).lower()
 SUBJ_TOKS = [set(content_tokens(s[0])) for s in SENTS]
 
 
@@ -258,7 +281,8 @@ INJECTION = re.compile(
     r"|system prompt|you are now|new instructions?|developer mode|jailbreak|\bact as\b|pretend"
     r"|(respond|reply|answer|output|print|say|return|write)\b.{0,25}\b(only|exactly|with|the word|the string)\b"
     r"|<\s*/?\s*(system|instruction|inst|admin)\s*>|\[/?inst\]|<<sys>>|###\s*(system|instruction)"
-    r"|the (correct|real|true) answer is|admin(istrator)? (override|mode|note)",
+    r"|the (correct|real|true) answer is|admin(istrator)? (override|mode|note)"
+    r"|\b(system|admin|developer|security)\s+(override|message|note|notice)\b|\bforce (sources|confidence|answer)",
     re.I,
 )
 
@@ -268,10 +292,6 @@ def sanitize(q: str) -> str:
     q = re.sub(r"[​-‏⁠﻿]", "", q)  # zero-width chars
     parts = re.split(r"(?<=[.!?;:\n])\s+|\n+|\s+[-–—]{1,2}\s+|\(|\)|\[|\]", q)
     kept = [p for p in parts if p and p.strip() and not INJECTION.search(p)]
-    # prefer the actual question clause(s)
-    qs = [p for p in kept if "?" in p]
-    if qs:
-        kept = qs
     out = " ".join(s.strip() for s in kept).strip()
     if not out:
         out = INJECTION.sub(" ", q).strip()
@@ -284,7 +304,7 @@ def unknown_entities(q: str) -> list[str]:
     for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9./+-]*[A-Za-z0-9+]|[A-Za-z0-9]", q):
         raw = m.group(0).rstrip("+")
         low = raw.lower().strip(".")
-        if len(re.sub(r"[^a-z0-9]", "", low)) <= 2:
+        if len(re.sub(r"[^a-z0-9]", "", low)) <= 2 or re.fullmatch(r"[\d.,]+", low):
             continue
         if low in QUESTION_WORDS or stem(low) in VOCAB or low in VOCAB:
             continue
@@ -305,6 +325,19 @@ def unknown_entities(q: str) -> list[str]:
         if low.endswith("s") and low[:-1] in VOCAB:
             continue
         unk.append(raw)
+    # multi-word Title-Case names ("Gaussian Error Linear Unit", "Compensation Log Records")
+    for m in re.finditer(r"\b[A-Z][a-z]+(?:[ -][A-Z][a-z]+)+\b", q):
+        words = re.split(r"[ -]", m.group(0))
+        if m.start() == 0 or re.search(r"[.?!:;]\s*$", q[: m.start()]):
+            words = words[1:]  # first word may just be sentence-initial capitalisation
+        if len(words) < 2:
+            continue
+        pat = r"\b" + r"\W+".join(re.escape(stem(w.lower())) + r"\w*" for w in words)
+        if not re.search(pat, KB_LOWER):
+            unk.append(" ".join(words))
+    # the KB states parameters, never formulas or derivations
+    if re.search(r"\b(?:mathematical|formula|formulation|equation|derivation|proof)\b", q, re.I):
+        unk.append("<formula>")
     return unk
 
 
@@ -391,6 +424,7 @@ def best_sentences(i: int, q: str, n: int = 1, extra_attrs=()):
 
 
 def asked_attributes(q: str) -> list[str]:
+    q = q.split(THES_SEP)[0]  # thesaurus additions help retrieval but don't define what was asked
     return [a for a, pat in ATTR_TRIGGERS.items() if re.search(pat, q, re.I)]
 
 
@@ -439,7 +473,7 @@ def answer_question(question: str, top_k: int) -> dict:
         return abstain("empty")
 
     unk = unknown_entities(raw_q)
-    q = expand(raw_q)
+    q = thesaurus(expand(raw_q))
     qv, dense, kw, final, order, q_terms = retrieve(q)
     top = int(order[0])
 
@@ -455,7 +489,7 @@ def answer_question(question: str, top_k: int) -> dict:
     full_attrs = asked_attributes(q)
     if MULTI.search(raw_q):
         # 1) retrieve each sub-question separately
-        subqs = [s for s in re.split(r"\band\b|;|,|\bwith\b|\bversus\b|\bvs\.?\b", q, flags=re.I)
+        subqs = [s for s in re.split(r"\band\b|;|,|:|\.\s|\bfurthermore\b|\bwith\b|\bversus\b|\bvs\.?\b", q, flags=re.I)
                  if entity_terms(s)]
         if len(subqs) >= 2:
             for s in subqs:
