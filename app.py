@@ -515,17 +515,60 @@ app = FastAPI(title="KB RAG")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-class Query(BaseModel):
-    question: str = ""
-    top_k: int | None = 3
+import collections
+import time as _time
+
+from fastapi import Request
+from starlette.concurrency import run_in_threadpool
+
+REQUEST_LOG: collections.deque = collections.deque(maxlen=500)
 
 
-@app.post("/query")
-def query(body: Query):
-    res = dict(answer_question((body.question or "").strip()[:4000], int(body.top_k or 3)))
-    if os.environ.get("DEBUG") != "1":
-        res.pop("_reason", None)
+def _parse_body(raw: bytes, params) -> tuple[str, int]:
+    data = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    q = data.get("question") or data.get("query") or data.get("q") or params.get("question") or params.get("q") or ""
+    try:
+        k = int(data.get("top_k") or data.get("k") or params.get("top_k") or 3)
+    except (TypeError, ValueError):
+        k = 3
+    return str(q), k
+
+
+@app.api_route("/query", methods=["POST", "GET"])
+@app.api_route("/query/", methods=["POST", "GET"], include_in_schema=False)
+async def query(request: Request):
+    t = _time.time()
+    raw = await request.body()
+    q, k = _parse_body(raw, request.query_params)
+    res = dict(await run_in_threadpool(answer_question, q.strip()[:4000], k))
+    reason = res.pop("_reason", None)
+    entry = {
+        "t": _time.strftime("%Y-%m-%d %H:%M:%S", _time.gmtime()),
+        "ms": round((_time.time() - t) * 1000),
+        "method": request.method,
+        "ua": request.headers.get("user-agent", "")[:120],
+        "origin": request.headers.get("origin"),
+        "raw": raw[:2000].decode("utf-8", "replace"),
+        "response": res,
+        "reason": reason,
+    }
+    REQUEST_LOG.append(entry)
+    print("QUERYLOG", json.dumps(entry), flush=True)
+    if os.environ.get("DEBUG") == "1":
+        res["_reason"] = reason
     return res
+
+
+@app.get("/debug/requests")
+def debug_requests(n: int = 200):
+    return list(REQUEST_LOG)[-n:]
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
