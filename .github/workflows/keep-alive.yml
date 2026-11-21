@@ -1,0 +1,15 @@
+name: keep-alive
+# Backup pinger so the Render free instance doesn't sleep (it idles out after 15 min).
+# GitHub may delay scheduled runs; use UptimeRobot/cron-job.org as the primary pinger.
+# Set the repo variable SERVICE_URL (e.g. https://kb-rag.onrender.com) to enable.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    if: ${{ vars.SERVICE_URL != '' }}
+    steps:
+      - run: curl -s -m 90 -o /dev/null -w "%{http_code} %{time_total}s\n" "${{ vars.SERVICE_URL }}/health"

@@ -3,3 +3,4 @@
 model_cache
 __pycache__
 *.pyc
+emb_cache.npz

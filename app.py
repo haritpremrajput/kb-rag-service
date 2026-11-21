@@ -193,8 +193,36 @@ def _build_acronyms() -> dict[str, str]:
 
 
 ACRONYMS = _build_acronyms()
-P_EMB = embed(KB)
-S_EMB = [embed(s) for s in SENTS]
+
+
+def _load_or_build_embeddings():
+    """Passage + sentence embeddings, cached on disk keyed by KB/model hash.
+
+    The Docker build runs `import app` once, so containers start by loading this
+    file instead of re-embedding ~300 texts on a throttled CPU.
+    """
+    import hashlib
+    key = hashlib.sha1(json.dumps([MODEL_NAME, KB, SENTS]).encode()).hexdigest()
+    path = BASE / "emb_cache.npz"
+    if path.exists():
+        try:
+            z = np.load(path)
+            if str(z["key"]) == key:
+                offs = z["offsets"]
+                return z["p"], [z["s"][offs[i]:offs[i + 1]] for i in range(len(offs) - 1)]
+        except Exception:
+            pass
+    p_emb = embed(KB)
+    s_emb = [embed(x) for x in SENTS]
+    offs = np.cumsum([0] + [len(x) for x in s_emb])
+    try:
+        np.savez(path, key=key, p=p_emb, s=np.concatenate(s_emb), offsets=offs)
+    except OSError:
+        pass
+    return p_emb, s_emb
+
+
+P_EMB, S_EMB = _load_or_build_embeddings()
 
 # Attribute words: if the question asks for one of these and the chosen passage
 # never mentions it, the KB does not contain the answer -> abstain.
