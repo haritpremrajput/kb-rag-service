@@ -486,6 +486,7 @@ def answer_question(question: str, top_k: int) -> dict:
     # question that the top passage does not mention.
     chosen = [top]
     sub_of = {top: q}
+    sub_score: dict[int, float] = {}  # each passage scored against its own sub-question
     full_attrs = asked_attributes(q)
     if MULTI.search(raw_q):
         # 1) retrieve each sub-question separately
@@ -498,8 +499,10 @@ def answer_question(question: str, top_k: int) -> dict:
                 if j not in chosen and d2[j] >= DENSE_MIN and f2[j] >= FINAL_MIN:
                     chosen.append(j)
                     sub_of[j] = s
+                    sub_score[j] = float(f2[j])
                 elif j == top:
                     sub_of[top] = s
+                    sub_score[top] = max(sub_score.get(top, 0.0), float(f2[j]))
         # 2) fallback: a passage naming an entity the top passage lacks
         if len(chosen) == 1:
             ents = entity_terms(q)
@@ -521,14 +524,22 @@ def answer_question(question: str, top_k: int) -> dict:
                 chosen.remove(i)
                 break
 
+    multi = len(chosen) > 1
+    if multi:  # present passages in the order the question mentions them
+        chosen.sort(key=lambda i: (q.find(sub_of[i]) if sub_of[i] != q else 10**6))
+
     pieces = []
     for i in chosen:
         sents, covered = best_sentences(i, sub_of[i], n=1, extra_attrs=full_attrs if multi else ())
         if not covered and i == top and not multi:
             return abstain(f"best sentence of passage {i} does not cover the question focus")
+        if multi and SENTS[i][0] not in sents:
+            # synthesis: name each passage's subject, then its key fact
+            sents = [SENTS[i][0]] + sents
         pieces.extend(sents)
     answer = " ".join(pieces)
 
+    score = {int(i): max(float(final[i]), sub_score.get(int(i), 0.0)) for i in range(N)}
     k = max(1, min(int(top_k or 3), N))
     srcs = [int(i) for i in chosen]
     for j in order:
@@ -537,9 +548,9 @@ def answer_question(question: str, top_k: int) -> dict:
         if int(j) not in srcs:
             srcs.append(int(j))
     srcs = srcs[:k]
-    scs = sorted((round(float(final[i]), 4) for i in srcs), reverse=True)
     # keep sources aligned with descending score order
-    srcs = sorted(srcs, key=lambda i: -final[i])
+    srcs = sorted(srcs, key=lambda i: -score[i])
+    scs = [round(min(1.0, score[i]), 4) for i in srcs]
     conf = round(float(min(0.99, 0.6 + 0.6 * max(0.0, final[top] - FINAL_MIN))), 4)
     return {"answer": answer, "sources": srcs, "scores": scs, "confidence": conf}
 
