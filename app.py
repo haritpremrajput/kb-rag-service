@@ -423,6 +423,29 @@ def best_sentences(i: int, q: str, n: int = 1, extra_attrs=()):
     return [SENTS[i][j] for j in sorted(idx)], covered
 
 
+PREMISE = re.compile(
+    r"\b(?:since|given that|given|assuming(?: that)?|as|because|considering(?: that)?|if|knowing that)\b"
+    r"([^,?]*?\d[^,?]*?)(?:,|\bthen\b|\bwhat\b|\bhow\b|\bwhich\b)",
+    re.I,
+)
+NUM = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)(?:\s*(ms|bits?|%))?")
+
+
+def false_premise(q: str, passages: list[int]) -> str | None:
+    """Return the claimed figure if a premise clause states a number the passages don't contain."""
+    for m in PREMISE.finditer(q):
+        clause = m.group(1)
+        for n in NUM.finditer(clause):
+            val = n.group(1)
+            # skip numbers that are part of names (TLS 1.3, HTTP/2, SHA-256, OAuth 2.0)
+            before = clause[: n.start()]
+            if re.search(r"[A-Za-z]+[-/ ]?$", before) and re.search(r"(TLS|HTTP|SHA|OAuth|v|Ed|ChaCha|Poly)[-/ ]?$", before, re.I):
+                continue
+            if not any(re.search(r"(?<![\d.])" + re.escape(val) + r"(?![\d])", KB[i]) for i in passages):
+                return clause.strip()
+    return None
+
+
 def asked_attributes(q: str) -> list[str]:
     q = q.split(THES_SEP)[0]  # thesaurus additions help retrieval but don't define what was asked
     return [a for a, pat in ATTR_TRIGGERS.items() if re.search(pat, q, re.I)]
@@ -527,6 +550,12 @@ def answer_question(question: str, top_k: int) -> dict:
     multi = len(chosen) > 1
     if multi:  # present passages in the order the question mentions them
         chosen.sort(key=lambda i: (q.find(sub_of[i]) if sub_of[i] != q else 10**6))
+
+    # false-premise injection: "Since Raft requires 100 nodes..., what is X?" where the stated
+    # figure contradicts the passage -> the question rests on a false claim, so abstain
+    bad = false_premise(raw_q, chosen)
+    if bad:
+        return abstain(f"false premise: {bad}")
 
     pieces = []
     for i in chosen:
